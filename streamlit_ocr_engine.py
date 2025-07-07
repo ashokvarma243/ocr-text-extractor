@@ -15,10 +15,10 @@ import shutil
 class StreamlitOCREngine:
     def __init__(self):
         self.setup_cloud_environment()
-        self.confidence_threshold = 10
+        self.confidence_threshold = 10  # Lower for better detection
         self.row_height_threshold = 25
-        self.word_spacing_threshold = 30  # Pixels - adjust this for sensitivity
-        self.column_break_threshold = 80  # Larger gaps indicate column breaks
+        self.word_spacing_threshold = 30  # Pixels for word grouping
+        self.column_break_threshold = 80  # Pixels for column breaks
     
     def setup_cloud_environment(self):
         """Setup OCR for cloud deployment"""
@@ -45,40 +45,98 @@ class StreamlitOCREngine:
                 os.environ['TESSDATA_PREFIX'] = path
                 break
     
+    def preprocess_image_for_forms(self, image):
+        """Optimized preprocessing for form documents"""
+        try:
+            if isinstance(image, Image.Image):
+                opencv_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+            else:
+                opencv_image = image
+            
+            gray = cv2.cvtColor(opencv_image, cv2.COLOR_BGR2GRAY)
+            
+            # Minimal preprocessing for clean documents
+            denoised = cv2.fastNlMeansDenoising(gray, h=3, templateWindowSize=7, searchWindowSize=21)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+            enhanced = clahe.apply(denoised)
+            
+            return Image.fromarray(enhanced)
+            
+        except Exception as e:
+            print(f"Error in preprocessing: {str(e)}")
+            return image
+    
     def extract_text_with_word_level_data(self, image):
-        """Extract text with word-level positioning data"""
+        """Extract text with word-level positioning data for smart spacing"""
         try:
             processed_image = self.preprocess_image_for_forms(image)
             
-            # Get word-level OCR data for better spacing analysis
-            ocr_data = pytesseract.image_to_data(
-                processed_image, 
-                output_type=pytesseract.Output.DICT,
-                config='--psm 6 -c preserve_interword_spaces=1'
-            )
+            # Try multiple OCR configurations for best results
+            configs = [
+                '--psm 6 -c preserve_interword_spaces=1',
+                '--psm 4 -c preserve_interword_spaces=1',
+                '--psm 3 -c preserve_interword_spaces=1',
+                '--psm 11 -c preserve_interword_spaces=1'
+            ]
             
-            # Extract word-level elements
-            words = []
-            for i in range(len(ocr_data['text'])):
-                text = ocr_data['text'][i].strip()
-                confidence = int(ocr_data['conf'][i]) if ocr_data['conf'][i] != '-1' else 0
-                
-                if text and len(text.strip()) >= 1 and confidence >= self.confidence_threshold:
-                    words.append({
-                        'text': self.gentle_text_cleaning(text),
-                        'left': ocr_data['left'][i],
-                        'top': ocr_data['top'][i],
-                        'width': ocr_data['width'][i],
-                        'height': ocr_data['height'][i],
-                        'confidence': confidence,
-                        'right': ocr_data['left'][i] + ocr_data['width'][i]
-                    })
+            best_words = []
+            best_score = 0
             
-            return words
+            for config in configs:
+                try:
+                    # Get word-level OCR data
+                    ocr_data = pytesseract.image_to_data(
+                        processed_image, 
+                        output_type=pytesseract.Output.DICT,
+                        config=config
+                    )
+                    
+                    # Extract word-level elements
+                    words = []
+                    for i in range(len(ocr_data['text'])):
+                        text = ocr_data['text'][i].strip()
+                        confidence = int(ocr_data['conf'][i]) if ocr_data['conf'][i] != '-1' else 0
+                        
+                        if text and len(text.strip()) >= 1 and confidence >= self.confidence_threshold:
+                            words.append({
+                                'text': self.gentle_text_cleaning(text),
+                                'left': ocr_data['left'][i],
+                                'top': ocr_data['top'][i],
+                                'width': ocr_data['width'][i],
+                                'height': ocr_data['height'][i],
+                                'confidence': confidence,
+                                'right': ocr_data['left'][i] + ocr_data['width'][i]
+                            })
+                    
+                    # Score this configuration
+                    if words:
+                        score = self.calculate_extraction_score(words)
+                        if score > best_score:
+                            best_score = score
+                            best_words = words
+                            
+                except Exception as e:
+                    print(f"OCR config {config} failed: {e}")
+                    continue
+            
+            return best_words
             
         except Exception as e:
             print(f"Error extracting word-level data: {str(e)}")
             return []
+    
+    def calculate_extraction_score(self, words):
+        """Calculate quality score for OCR results"""
+        if not words:
+            return 0
+        
+        total_confidence = sum(word['confidence'] for word in words)
+        avg_confidence = total_confidence / len(words)
+        total_text_length = sum(len(word['text']) for word in words)
+        
+        # Score based on quantity, confidence, and text length
+        score = (len(words) * 0.4) + (avg_confidence * 0.3) + (total_text_length * 0.3)
+        return score
     
     def group_words_by_spacing(self, words):
         """Group words based on horizontal spacing to preserve natural text flow"""
@@ -101,14 +159,16 @@ class StreamlitOCREngine:
                 if current_row:
                     # Process the completed row
                     processed_row = self.process_row_spacing(current_row)
-                    rows.extend(processed_row)
+                    if processed_row:
+                        rows.append(processed_row)
                 current_row = [word]
                 current_top = word['top']
         
         # Process the last row
         if current_row:
             processed_row = self.process_row_spacing(current_row)
-            rows.extend(processed_row)
+            if processed_row:
+                rows.append(processed_row)
         
         return rows
     
@@ -138,14 +198,18 @@ class StreamlitOCREngine:
             else:
                 # Large gap - start new group
                 if current_group:
-                    text_groups.append(self.merge_word_group(current_group))
+                    merged_group = self.merge_word_group(current_group)
+                    if merged_group:
+                        text_groups.append(merged_group)
                 current_group = [current_word]
         
         # Add the last group
         if current_group:
-            text_groups.append(self.merge_word_group(current_group))
+            merged_group = self.merge_word_group(current_group)
+            if merged_group:
+                text_groups.append(merged_group)
         
-        return [text_groups] if text_groups else []
+        return text_groups
     
     def merge_word_group(self, word_group):
         """Merge a group of words into a single text element"""
@@ -153,7 +217,10 @@ class StreamlitOCREngine:
             return None
         
         # Combine text with single spaces
-        combined_text = ' '.join(word['text'] for word in word_group)
+        combined_text = ' '.join(word['text'] for word in word_group if word['text'].strip())
+        
+        if not combined_text.strip():
+            return None
         
         # Calculate bounding box for the group
         left = min(word['left'] for word in word_group)
@@ -173,45 +240,39 @@ class StreamlitOCREngine:
             'confidence': avg_confidence
         }
     
-    def detect_column_breaks(self, text_groups):
+    def detect_column_breaks(self, grouped_rows):
         """Detect major column breaks in grouped text"""
-        if not text_groups:
+        if not grouped_rows:
             return []
         
-        enhanced_groups = []
+        enhanced_rows = []
         
-        for group_row in text_groups:
-            if len(group_row) <= 1:
-                enhanced_groups.append(group_row)
+        for row_groups in grouped_rows:
+            if len(row_groups) <= 1:
+                enhanced_rows.append(row_groups)
                 continue
             
             # Analyze gaps between groups in this row
-            column_groups = []
-            current_column = [group_row[0]]
+            final_groups = []
             
-            for i in range(1, len(group_row)):
-                current_group = group_row[i]
-                previous_group = group_row[i-1]
-                
-                # Calculate gap between text groups
-                gap = current_group['left'] - (previous_group['left'] + previous_group['width'])
-                
-                if gap >= self.column_break_threshold:
-                    # Major gap - indicates column break
-                    column_groups.append(current_column)
-                    current_column = [current_group]
+            for i, group in enumerate(row_groups):
+                if i == 0:
+                    final_groups.append(group)
                 else:
-                    # Keep in same column
-                    current_column.append(current_group)
+                    # Check gap from previous group
+                    prev_group = row_groups[i-1]
+                    gap = group['left'] - (prev_group['left'] + prev_group['width'])
+                    
+                    # Add spacing indicator for large gaps
+                    if gap >= self.column_break_threshold:
+                        # Large gap detected - this helps with column placement
+                        group['column_break'] = True
+                    
+                    final_groups.append(group)
             
-            # Add the last column
-            if current_column:
-                column_groups.append(current_column)
-            
-            # Flatten column groups back to row format
-            enhanced_groups.append([group for column in column_groups for group in column])
+            enhanced_rows.append(final_groups)
         
-        return enhanced_groups
+        return enhanced_rows
     
     def create_smart_excel_layout(self, grouped_rows, filename):
         """Create Excel with intelligent column placement based on spacing"""
@@ -230,7 +291,7 @@ class StreamlitOCREngine:
                     excel_row += 1
                     continue
                 
-                # Determine column positions based on horizontal positions
+                # Determine column positions based on horizontal positions and breaks
                 column_positions = self.calculate_smart_columns(row_groups)
                 
                 for group, col_pos in zip(row_groups, column_positions):
@@ -254,28 +315,22 @@ class StreamlitOCREngine:
             return None
     
     def calculate_smart_columns(self, row_groups):
-        """Calculate column positions based on horizontal positioning"""
+        """Calculate column positions based on horizontal positioning and breaks"""
         if not row_groups:
             return []
         
-        # Sort groups by horizontal position
-        sorted_groups = sorted(enumerate(row_groups), key=lambda x: x[1]['left'])
-        
-        column_positions = [0] * len(row_groups)
+        column_positions = []
         current_column = 1
         
-        for i, (original_index, group) in enumerate(sorted_groups):
+        for i, group in enumerate(row_groups):
             if i == 0:
-                column_positions[original_index] = current_column
+                column_positions.append(current_column)
             else:
-                # Check gap from previous group
-                prev_group = sorted_groups[i-1][1]
-                gap = group['left'] - (prev_group['left'] + prev_group['width'])
-                
-                if gap >= self.column_break_threshold:
+                # Check if this group has a column break marker
+                if group.get('column_break', False):
                     current_column += 1
                 
-                column_positions[original_index] = current_column
+                column_positions.append(current_column)
         
         return column_positions
     
@@ -326,27 +381,6 @@ class StreamlitOCREngine:
             adjusted_width = min(max(width + 3, 15), 80)
             worksheet.column_dimensions[column].width = adjusted_width
     
-    def preprocess_image_for_forms(self, image):
-        """Optimized preprocessing for form documents"""
-        try:
-            if isinstance(image, Image.Image):
-                opencv_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-            else:
-                opencv_image = image
-            
-            gray = cv2.cvtColor(opencv_image, cv2.COLOR_BGR2GRAY)
-            
-            # Minimal preprocessing for clean documents
-            denoised = cv2.fastNlMeansDenoising(gray, h=3, templateWindowSize=7, searchWindowSize=21)
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-            enhanced = clahe.apply(denoised)
-            
-            return Image.fromarray(enhanced)
-            
-        except Exception as e:
-            print(f"Error in preprocessing: {str(e)}")
-            return image
-    
     def gentle_text_cleaning(self, text):
         """Gentle text cleaning that preserves structure"""
         if not text:
@@ -371,7 +405,7 @@ class StreamlitOCREngine:
             words = self.extract_text_with_word_level_data(image)
             
             if not words:
-                return None, "No text detected. Try adjusting confidence threshold."
+                return None, "No text detected. Try adjusting confidence threshold or spacing controls."
             
             # Group words by spacing
             grouped_rows = self.group_words_by_spacing(words)

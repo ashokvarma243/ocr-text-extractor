@@ -15,9 +15,10 @@ import shutil
 class StreamlitOCREngine:
     def __init__(self):
         self.setup_cloud_environment()
-        self.confidence_threshold = 10  # Even lower for better detection
+        self.confidence_threshold = 10
         self.row_height_threshold = 25
-        self.column_gap_threshold = 50
+        self.word_spacing_threshold = 30  # Pixels - adjust this for sensitivity
+        self.column_break_threshold = 80  # Larger gaps indicate column breaks
     
     def setup_cloud_environment(self):
         """Setup OCR for cloud deployment"""
@@ -44,221 +45,204 @@ class StreamlitOCREngine:
                 os.environ['TESSDATA_PREFIX'] = path
                 break
     
-    def preprocess_image_for_forms(self, image):
-        """Specialized preprocessing for form documents"""
+    def extract_text_with_word_level_data(self, image):
+        """Extract text with word-level positioning data"""
         try:
-            # Convert PIL to OpenCV
-            if isinstance(image, Image.Image):
-                opencv_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-            else:
-                opencv_image = image
+            processed_image = self.preprocess_image_for_forms(image)
             
-            # Convert to grayscale
-            gray = cv2.cvtColor(opencv_image, cv2.COLOR_BGR2GRAY)
+            # Get word-level OCR data for better spacing analysis
+            ocr_data = pytesseract.image_to_data(
+                processed_image, 
+                output_type=pytesseract.Output.DICT,
+                config='--psm 6 -c preserve_interword_spaces=1'
+            )
             
-            # For forms, try minimal preprocessing to preserve text clarity
-            # 1. Slight denoising
-            denoised = cv2.fastNlMeansDenoising(gray, h=3, templateWindowSize=7, searchWindowSize=21)
-            
-            # 2. Enhance contrast slightly
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-            enhanced = clahe.apply(denoised)
-            
-            # 3. For clean documents like forms, often original or lightly enhanced works best
-            return Image.fromarray(enhanced)
-            
-        except Exception as e:
-            print(f"Error in preprocessing: {str(e)}")
-            return image
-    
-    def extract_text_comprehensive(self, image):
-        """Comprehensive text extraction with multiple methods"""
-        try:
-            # Try both original and preprocessed versions
-            original_pil = image
-            processed_pil = self.preprocess_image_for_forms(image)
-            
-            all_results = []
-            
-            # Different OCR configurations optimized for forms
-            configs = [
-                ('--psm 1 -c preserve_interword_spaces=1', 'Auto page segmentation with OSD'),
-                ('--psm 3 -c preserve_interword_spaces=1', 'Fully automatic page segmentation'),
-                ('--psm 4 -c preserve_interword_spaces=1', 'Single column of text'),
-                ('--psm 6 -c preserve_interword_spaces=1', 'Uniform block of text'),
-                ('--psm 11 -c preserve_interword_spaces=1', 'Sparse text'),
-                ('--psm 12 -c preserve_interword_spaces=1', 'Sparse text with OSD'),
-            ]
-            
-            # Try each configuration with both image versions
-            for config, description in configs:
-                for img_version, img_name in [(original_pil, 'original'), (processed_pil, 'processed')]:
-                    try:
-                        # Get OCR data
-                        ocr_data = pytesseract.image_to_data(
-                            img_version, 
-                            output_type=pytesseract.Output.DICT,
-                            config=config
-                        )
-                        
-                        # Extract elements with very low threshold
-                        elements = self.extract_elements_from_data(ocr_data, threshold=5)
-                        
-                        if elements:
-                            all_results.append({
-                                'config': config,
-                                'image_version': img_name,
-                                'description': description,
-                                'elements': elements,
-                                'score': self.calculate_result_score(elements)
-                            })
-                            
-                    except Exception as e:
-                        print(f"Config {config} with {img_name} failed: {e}")
-                        continue
-            
-            # Return the best result
-            if all_results:
-                best_result = max(all_results, key=lambda x: x['score'])
-                print(f"Best result: {best_result['description']} with {best_result['image_version']} image")
-                return best_result['elements']
-            else:
-                return []
+            # Extract word-level elements
+            words = []
+            for i in range(len(ocr_data['text'])):
+                text = ocr_data['text'][i].strip()
+                confidence = int(ocr_data['conf'][i]) if ocr_data['conf'][i] != '-1' else 0
                 
-        except Exception as e:
-            print(f"Error in comprehensive extraction: {str(e)}")
-            return []
-    
-    def extract_elements_from_data(self, ocr_data, threshold=10):
-        """Extract text elements from OCR data with flexible threshold"""
-        elements = []
-        
-        for i in range(len(ocr_data['text'])):
-            text = ocr_data['text'][i].strip()
-            confidence = int(ocr_data['conf'][i]) if ocr_data['conf'][i] != '-1' else 0
-            
-            # More lenient text filtering
-            if text and len(text.strip()) >= 1 and confidence >= threshold:
-                # Minimal cleaning to preserve original text
-                cleaned_text = self.gentle_text_cleaning(text)
-                if cleaned_text:
-                    elements.append({
-                        'text': cleaned_text,
+                if text and len(text.strip()) >= 1 and confidence >= self.confidence_threshold:
+                    words.append({
+                        'text': self.gentle_text_cleaning(text),
                         'left': ocr_data['left'][i],
                         'top': ocr_data['top'][i],
                         'width': ocr_data['width'][i],
                         'height': ocr_data['height'][i],
-                        'confidence': confidence
+                        'confidence': confidence,
+                        'right': ocr_data['left'][i] + ocr_data['width'][i]
                     })
-        
-        return elements
+            
+            return words
+            
+        except Exception as e:
+            print(f"Error extracting word-level data: {str(e)}")
+            return []
     
-    def gentle_text_cleaning(self, text):
-        """Gentle text cleaning that preserves most characters"""
-        if not text:
-            return ""
-        
-        # Only remove excessive whitespace
-        text = re.sub(r'\s+', ' ', text.strip())
-        
-        # Only fix obvious OCR errors, preserve most text
-        obvious_errors = {
-            '|': 'I',  # Common pipe to I error
-            '0': 'O',  # Only in all-caps words
-        }
-        
-        # Apply minimal corrections
-        words = text.split()
-        corrected_words = []
-        
-        for word in words:
-            if word.isupper() and '0' in word:
-                word = word.replace('0', 'O')
-            if '|' in word:
-                word = word.replace('|', 'I')
-            corrected_words.append(word)
-        
-        return ' '.join(corrected_words)
-    
-    def calculate_result_score(self, elements):
-        """Calculate quality score for OCR results"""
-        if not elements:
-            return 0
-        
-        total_confidence = sum(elem['confidence'] for elem in elements)
-        avg_confidence = total_confidence / len(elements)
-        total_text_length = sum(len(elem['text']) for elem in elements)
-        
-        # Score based on quantity, confidence, and text length
-        score = (len(elements) * 0.4) + (avg_confidence * 0.3) + (total_text_length * 0.3)
-        return score
-    
-    def create_structured_layout(self, text_elements):
-        """Create structured layout that preserves document organization"""
-        if not text_elements:
+    def group_words_by_spacing(self, words):
+        """Group words based on horizontal spacing to preserve natural text flow"""
+        if not words:
             return []
         
-        # Sort by vertical position first
-        text_elements.sort(key=lambda x: x['top'])
+        # Sort words by vertical position first, then horizontal
+        words.sort(key=lambda x: (x['top'], x['left']))
         
-        # Group into logical rows with more flexible threshold
+        # Group into rows
         rows = []
         current_row = []
         current_top = None
         
-        for element in text_elements:
-            if current_top is None or abs(element['top'] - current_top) <= self.row_height_threshold:
-                current_row.append(element)
-                current_top = element['top'] if current_top is None else current_top
+        for word in words:
+            if current_top is None or abs(word['top'] - current_top) <= self.row_height_threshold:
+                current_row.append(word)
+                current_top = word['top'] if current_top is None else current_top
             else:
                 if current_row:
-                    # Sort row by horizontal position
-                    current_row.sort(key=lambda x: x['left'])
-                    rows.append(current_row)
-                current_row = [element]
-                current_top = element['top']
+                    # Process the completed row
+                    processed_row = self.process_row_spacing(current_row)
+                    rows.extend(processed_row)
+                current_row = [word]
+                current_top = word['top']
         
-        # Don't forget the last row
+        # Process the last row
         if current_row:
-            current_row.sort(key=lambda x: x['left'])
-            rows.append(current_row)
+            processed_row = self.process_row_spacing(current_row)
+            rows.extend(processed_row)
         
         return rows
     
-    def create_enhanced_excel(self, rows, filename):
-        """Create Excel with better structure preservation"""
+    def process_row_spacing(self, row_words):
+        """Process a single row to group words by spacing"""
+        if not row_words:
+            return []
+        
+        # Sort words in the row by horizontal position
+        row_words.sort(key=lambda x: x['left'])
+        
+        # Group words based on spacing
+        text_groups = []
+        current_group = [row_words[0]]
+        
+        for i in range(1, len(row_words)):
+            current_word = row_words[i]
+            previous_word = row_words[i-1]
+            
+            # Calculate gap between words
+            gap = current_word['left'] - previous_word['right']
+            
+            # Determine if words should be grouped together
+            if gap <= self.word_spacing_threshold:
+                # Small gap - keep words together
+                current_group.append(current_word)
+            else:
+                # Large gap - start new group
+                if current_group:
+                    text_groups.append(self.merge_word_group(current_group))
+                current_group = [current_word]
+        
+        # Add the last group
+        if current_group:
+            text_groups.append(self.merge_word_group(current_group))
+        
+        return [text_groups] if text_groups else []
+    
+    def merge_word_group(self, word_group):
+        """Merge a group of words into a single text element"""
+        if not word_group:
+            return None
+        
+        # Combine text with single spaces
+        combined_text = ' '.join(word['text'] for word in word_group)
+        
+        # Calculate bounding box for the group
+        left = min(word['left'] for word in word_group)
+        top = min(word['top'] for word in word_group)
+        right = max(word['right'] for word in word_group)
+        bottom = max(word['top'] + word['height'] for word in word_group)
+        
+        # Calculate average confidence
+        avg_confidence = sum(word['confidence'] for word in word_group) / len(word_group)
+        
+        return {
+            'text': combined_text,
+            'left': left,
+            'top': top,
+            'width': right - left,
+            'height': bottom - top,
+            'confidence': avg_confidence
+        }
+    
+    def detect_column_breaks(self, text_groups):
+        """Detect major column breaks in grouped text"""
+        if not text_groups:
+            return []
+        
+        enhanced_groups = []
+        
+        for group_row in text_groups:
+            if len(group_row) <= 1:
+                enhanced_groups.append(group_row)
+                continue
+            
+            # Analyze gaps between groups in this row
+            column_groups = []
+            current_column = [group_row[0]]
+            
+            for i in range(1, len(group_row)):
+                current_group = group_row[i]
+                previous_group = group_row[i-1]
+                
+                # Calculate gap between text groups
+                gap = current_group['left'] - (previous_group['left'] + previous_group['width'])
+                
+                if gap >= self.column_break_threshold:
+                    # Major gap - indicates column break
+                    column_groups.append(current_column)
+                    current_column = [current_group]
+                else:
+                    # Keep in same column
+                    current_column.append(current_group)
+            
+            # Add the last column
+            if current_column:
+                column_groups.append(current_column)
+            
+            # Flatten column groups back to row format
+            enhanced_groups.append([group for column in column_groups for group in column])
+        
+        return enhanced_groups
+    
+    def create_smart_excel_layout(self, grouped_rows, filename):
+        """Create Excel with intelligent column placement based on spacing"""
         try:
             wb = Workbook()
             ws = wb.active
-            ws.title = "Extracted_Text"
+            ws.title = "Smart_Layout"
             
-            if not rows:
+            if not grouped_rows:
                 return None
             
             excel_row = 1
             
-            for row_elements in rows:
-                if not row_elements:
+            for row_groups in grouped_rows:
+                if not row_groups:
                     excel_row += 1
                     continue
                 
-                # For forms, try to detect columns more intelligently
-                if len(row_elements) == 1:
-                    # Single element - full width
-                    cell = ws.cell(row=excel_row, column=1)
-                    cell.value = row_elements[0]['text']
-                    self.format_cell(cell, row_elements[0])
-                else:
-                    # Multiple elements - distribute across columns
-                    for col_idx, element in enumerate(row_elements, 1):
-                        cell = ws.cell(row=excel_row, column=col_idx)
-                        cell.value = element['text']
-                        self.format_cell(cell, element)
+                # Determine column positions based on horizontal positions
+                column_positions = self.calculate_smart_columns(row_groups)
+                
+                for group, col_pos in zip(row_groups, column_positions):
+                    if group and group['text'].strip():
+                        cell = ws.cell(row=excel_row, column=col_pos)
+                        cell.value = group['text']
+                        self.format_cell_smart(cell, group)
                 
                 excel_row += 1
             
             # Auto-adjust column widths
-            self.adjust_column_widths(ws)
+            self.adjust_column_widths_smart(ws)
             
             # Save to temporary file
             temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx')
@@ -266,75 +250,141 @@ class StreamlitOCREngine:
             return temp_file.name
             
         except Exception as e:
-            print(f"Error creating Excel: {str(e)}")
+            print(f"Error creating smart Excel layout: {str(e)}")
             return None
     
-    def format_cell(self, cell, element):
-        """Apply formatting based on text characteristics"""
+    def calculate_smart_columns(self, row_groups):
+        """Calculate column positions based on horizontal positioning"""
+        if not row_groups:
+            return []
+        
+        # Sort groups by horizontal position
+        sorted_groups = sorted(enumerate(row_groups), key=lambda x: x[1]['left'])
+        
+        column_positions = [0] * len(row_groups)
+        current_column = 1
+        
+        for i, (original_index, group) in enumerate(sorted_groups):
+            if i == 0:
+                column_positions[original_index] = current_column
+            else:
+                # Check gap from previous group
+                prev_group = sorted_groups[i-1][1]
+                gap = group['left'] - (prev_group['left'] + prev_group['width'])
+                
+                if gap >= self.column_break_threshold:
+                    current_column += 1
+                
+                column_positions[original_index] = current_column
+        
+        return column_positions
+    
+    def format_cell_smart(self, cell, element):
+        """Apply smart formatting based on text characteristics"""
         text = element['text']
-        confidence = element['confidence']
         
         # Set base alignment
         cell.alignment = Alignment(wrap_text=True, vertical='top', horizontal='left')
         
-        # Format based on content
+        # Format based on content patterns
         if text.isupper() and len(text) > 3:
-            # Likely header
+            # Headers
             cell.font = Font(bold=True, size=12, color="1F4E79")
-        elif text.startswith(('•', '-', '*', '○')):
-            # Bullet point
+            cell.fill = PatternFill(start_color="E6F3FF", end_color="E6F3FF", fill_type="solid")
+        elif text.startswith(('•', '-', '*', '○', '▪')):
+            # Bullet points
             cell.font = Font(size=10)
             cell.alignment = Alignment(indent=1, wrap_text=True, vertical='top')
         elif re.match(r'^\d+\.', text):
-            # Numbered item
-            cell.font = Font(bold=True, size=11)
+            # Numbered items
+            cell.font = Font(bold=True, size=11, color="2E75B6")
+        elif len(text) > 50:
+            # Long text blocks
+            cell.font = Font(size=10)
+            cell.alignment = Alignment(wrap_text=True, vertical='top', horizontal='justify')
         else:
             # Regular text
             cell.font = Font(size=10)
-        
-        # Add confidence indicator as comment for debugging
-        if confidence < 50:
-            cell.font = Font(size=10, italic=True, color="666666")
     
-    def adjust_column_widths(self, worksheet):
-        """Intelligently adjust column widths"""
-        for column in worksheet.columns:
-            max_length = 0
-            column_letter = column[0].column_letter
-            
-            for cell in column:
-                try:
-                    if cell.value:
-                        cell_length = len(str(cell.value))
-                        if cell_length > max_length:
-                            max_length = cell_length
-                except:
-                    pass
-            
+    def adjust_column_widths_smart(self, worksheet):
+        """Intelligently adjust column widths based on content"""
+        column_widths = {}
+        
+        for row in worksheet.iter_rows():
+            for cell in row:
+                if cell.value:
+                    column = cell.column_letter
+                    content_length = len(str(cell.value))
+                    
+                    if column not in column_widths:
+                        column_widths[column] = content_length
+                    else:
+                        column_widths[column] = max(column_widths[column], content_length)
+        
+        for column, width in column_widths.items():
             # Set reasonable width limits
-            adjusted_width = min(max(max_length + 2, 15), 80)
-            worksheet.column_dimensions[column_letter].width = adjusted_width
+            adjusted_width = min(max(width + 3, 15), 80)
+            worksheet.column_dimensions[column].width = adjusted_width
+    
+    def preprocess_image_for_forms(self, image):
+        """Optimized preprocessing for form documents"""
+        try:
+            if isinstance(image, Image.Image):
+                opencv_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+            else:
+                opencv_image = image
+            
+            gray = cv2.cvtColor(opencv_image, cv2.COLOR_BGR2GRAY)
+            
+            # Minimal preprocessing for clean documents
+            denoised = cv2.fastNlMeansDenoising(gray, h=3, templateWindowSize=7, searchWindowSize=21)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+            enhanced = clahe.apply(denoised)
+            
+            return Image.fromarray(enhanced)
+            
+        except Exception as e:
+            print(f"Error in preprocessing: {str(e)}")
+            return image
+    
+    def gentle_text_cleaning(self, text):
+        """Gentle text cleaning that preserves structure"""
+        if not text:
+            return ""
+        
+        # Only clean excessive whitespace
+        text = re.sub(r'\s+', ' ', text.strip())
+        
+        # Fix only obvious OCR errors
+        if '|' in text:
+            text = text.replace('|', 'I')
+        
+        return text
     
     def process_image(self, image_file, filename):
-        """Process image with enhanced extraction"""
+        """Process image with smart spacing-based layout"""
         try:
             # Open image
             image = Image.open(image_file)
             
-            # Use comprehensive extraction
-            text_elements = self.extract_text_comprehensive(image)
+            # Extract words with positioning
+            words = self.extract_text_with_word_level_data(image)
             
-            if not text_elements:
-                return None, "No text detected. Try adjusting confidence threshold or check image quality."
+            if not words:
+                return None, "No text detected. Try adjusting confidence threshold."
             
-            # Create structured layout
-            rows = self.create_structured_layout(text_elements)
+            # Group words by spacing
+            grouped_rows = self.group_words_by_spacing(words)
             
-            # Create Excel file
-            excel_path = self.create_enhanced_excel(rows, filename)
+            # Detect and handle column breaks
+            enhanced_rows = self.detect_column_breaks(grouped_rows)
+            
+            # Create Excel with smart layout
+            excel_path = self.create_smart_excel_layout(enhanced_rows, filename)
             
             if excel_path:
-                return excel_path, f"Extracted {len(text_elements)} text elements organized into {len(rows)} rows"
+                total_groups = sum(len(row) for row in enhanced_rows)
+                return excel_path, f"Extracted {len(words)} words grouped into {total_groups} text elements across {len(enhanced_rows)} rows"
             else:
                 return None, "Failed to create Excel output"
                 
@@ -342,33 +392,32 @@ class StreamlitOCREngine:
             return None, f"Error processing image: {str(e)}"
     
     def process_pdf(self, pdf_file, filename):
-        """Process PDF with enhanced extraction"""
+        """Process PDF with smart spacing-based layout"""
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
-                # Save PDF temporarily
                 temp_pdf_path = os.path.join(temp_dir, "temp.pdf")
                 with open(temp_pdf_path, "wb") as f:
                     f.write(pdf_file.read())
                 
-                # Convert with high quality
                 pages = convert_from_path(temp_pdf_path, dpi=300, fmt='png')
                 
                 excel_files = []
-                total_elements = 0
+                total_words = 0
                 
                 for page_num, page in enumerate(pages, 1):
-                    # Process each page
-                    text_elements = self.extract_text_comprehensive(page)
+                    words = self.extract_text_with_word_level_data(page)
                     
-                    if text_elements:
-                        rows = self.create_structured_layout(text_elements)
-                        excel_path = self.create_enhanced_excel(rows, f"{filename}_page_{page_num}")
+                    if words:
+                        grouped_rows = self.group_words_by_spacing(words)
+                        enhanced_rows = self.detect_column_breaks(grouped_rows)
+                        excel_path = self.create_smart_excel_layout(enhanced_rows, f"{filename}_page_{page_num}")
+                        
                         if excel_path:
                             excel_files.append((excel_path, f"Page {page_num}"))
-                            total_elements += len(text_elements)
+                            total_words += len(words)
                 
                 if excel_files:
-                    return excel_files, f"Processed {len(pages)} pages, extracted {total_elements} text elements"
+                    return excel_files, f"Processed {len(pages)} pages with smart spacing, extracted {total_words} words"
                 else:
                     return [], f"No text found in {len(pages)} pages"
                 

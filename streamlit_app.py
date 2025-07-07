@@ -106,8 +106,15 @@ def main():
         st.header("⚙️ Settings")
         confidence = st.slider("Confidence Threshold", 5, 90, 15, 
                               help="Lower values detect more text (try 10-20 for difficult images)")
-        row_height = st.slider("Row Height Threshold", 10, 50, 20, 
+        row_height = st.slider("Row Height Threshold", 10, 50, 25, 
                               help="Adjust for different document layouts")
+        
+        # Advanced spacing controls
+        st.subheader("📏 Spacing Controls")
+        word_spacing = st.slider("Word Spacing Threshold", 10, 50, 30, 
+                                help="Pixels - smaller values group words more tightly")
+        column_break = st.slider("Column Break Threshold", 50, 150, 80, 
+                                help="Pixels - larger gaps indicate new columns")
         
         # Debug mode
         debug_mode = st.checkbox("Enable Debug Mode", 
@@ -128,6 +135,7 @@ def main():
         - Use high-resolution images
         - Ensure text is clearly visible
         - Lower confidence threshold for difficult images
+        - Adjust spacing controls for better layout preservation
         """)
         
         st.header("ℹ️ About")
@@ -136,11 +144,12 @@ def main():
         while preserving the original layout and formatting.
         
         **Features:**
-        - Layout preservation
+        - Smart spacing-based layout preservation
         - Batch processing
         - Excel output format
         - Secure processing (files not stored)
         - Multiple OCR configurations for best results
+        - Intelligent column detection
         """)
     
     # Main content area
@@ -170,7 +179,7 @@ def main():
         
         if uploaded_files:
             if st.button("🔄 Process Files", type="primary", use_container_width=True):
-                process_files(uploaded_files, confidence, row_height, debug_mode)
+                process_files(uploaded_files, confidence, row_height, word_spacing, column_break, debug_mode)
         else:
             st.info("👆 Upload files to enable processing")
         
@@ -185,7 +194,7 @@ def main():
             except:
                 st.write("**Version:**", "Unable to detect")
 
-def process_files(uploaded_files, confidence, row_height, debug_mode):
+def process_files(uploaded_files, confidence, row_height, word_spacing, column_break, debug_mode):
     """Process uploaded files and provide download links"""
     
     # Initialize OCR engine
@@ -193,6 +202,8 @@ def process_files(uploaded_files, confidence, row_height, debug_mode):
         ocr_engine = StreamlitOCREngine()
         ocr_engine.confidence_threshold = confidence
         ocr_engine.row_height_threshold = row_height
+        ocr_engine.word_spacing_threshold = word_spacing
+        ocr_engine.column_break_threshold = column_break
     except Exception as e:
         st.error(f"Failed to initialize OCR engine: {e}")
         return
@@ -283,7 +294,7 @@ def process_files(uploaded_files, confidence, row_height, debug_mode):
                         if debug_mode:
                             with debug_container:
                                 st.write(f"❌ Engine processing failed: {message}")
-                                st.write("💡 Try lowering the confidence threshold or check image quality")
+                                st.write("💡 Try lowering the confidence threshold or adjusting spacing controls")
             
             except Exception as e:
                 st.error(f"❌ Error processing {uploaded_file.name}: {str(e)}")
@@ -341,6 +352,7 @@ def process_files(uploaded_files, confidence, row_height, debug_mode):
                    "- Try lowering the confidence threshold to 10-15\n"
                    "- Ensure images have clear, readable text\n"
                    "- Check that images are not too blurry or low resolution\n"
+                   "- Adjust spacing controls for better layout detection\n"
                    "- Enable debug mode to see detailed processing information")
 
 if __name__ == "__main__":
